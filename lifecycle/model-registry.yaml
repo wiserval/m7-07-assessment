@@ -1,0 +1,282 @@
+# Model Registry Specification — Personalized Recommendations (Scenario X)
+# Backend: MLflow
+# All fields marked required: true must be present at registration time.
+# Registration fails if any required field is missing or fails format validation.
+
+registry:
+  backend: mlflow
+  tracking_uri: "https://mlflow.internal.prod/recommender"
+  artifact_root: "s3://prod-models"
+  experiment_name: "recommender-ranker"
+
+# ── Naming ────────────────────────────────────────────────────────────────────
+
+naming:
+  format: "{model_name}/v{major}.{minor}.{patch}+{mlflow_run_id}"
+  example: "ranker/v1.3.0+abc1234def56"
+  registered_model_names:
+    - ranker              # two-stage ONNX MLP ranker; primary serving model
+    - cold-start-fallback # popularity-based model served to users with no history
+  versioning_rules:
+    patch: retrain with same architecture and feature set; no code changes
+    minor: new input features or architecture change; backward-compatible API
+    major: breaking API change or full architecture replacement
+  run_id:
+    source: MLflow auto-generated run ID
+    immutable: true
+    note: run ID is appended with + to follow PEP 440 local version identifier convention
+
+# ── Stage lifecycle ───────────────────────────────────────────────────────────
+
+stages:
+  - name: None
+    description: >
+      Freshly registered after training. Not yet evaluated. No traffic.
+      Artifact exists in S3 but MODEL_S3_URI is never set to this version.
+
+  - name: Staging
+    description: >
+      Passed all automated eval gate thresholds. Under 24-hour shadow
+      deployment. Predictions are logged to S3 but not returned to users.
+    entry_trigger: automated training pipeline on eval gate PASS
+
+  - name: Production
+    description: >
+      Approved for live traffic. May serve 100% of traffic (full rollout)
+      or a configured percentage (A/B experiment variant).
+    entry_trigger: human review gate APPROVE by ML Reviewer + ML Platform Lead
+
+  - name: Archived
+    description: >
+      No longer serving. Retained for audit, rollback, and reproducibility.
+    entry_triggers:
+      - new Production version stable for >= 48 hours (supersession)
+      - auto-rollback executed (SLO breach or drift)
+      - human review rejected or timed out (>72 hr without decision)
+
+# ── Stage transitions ─────────────────────────────────────────────────────────
+
+transitions:
+  none_to_staging:
+    gate: automated_eval
+    triggered_by: training_pipeline
+    all_must_pass:
+      auc_roc:
+        threshold: ">= 0.82"
+        eval_set: held-out last 7 days of user events; no overlap with training window
+        note: measured as ranking AUC across user-item pairs, not binary classification
+      ndcg_at_10:
+        threshold: ">= 0.31"
+        eval_set: same held-out set
+      p95_inference_latency_ms:
+        threshold: "<= 80"
+        hardware: c6i.2xlarge (8 vCPU / 16 GB RAM)
+        runtime: ONNX Runtime 1.17, INT8 quantized, batch_size=1, 10,000 iterations
+        note: 80 ms here provides headroom to the 100 ms end-to-end SLO
+      eval_set_min_samples:
+        threshold: ">= 50000"
+        rationale: models evaluated on smaller sets have shown unstable AUC estimates
+    on_pass: register to Staging; start shadow deployment job
+    on_fail:
+      action: do not register; alert #ml-platform with failing metric and value
+      message_format: >
+        "Eval gate FAIL for run {run_id}: {metric} = {value} (threshold: {threshold}).
+        Model not registered. Training job must be rerun."
+
+  staging_to_production:
+    gate: human_review
+    required_approvers:
+      - role: ML Reviewer
+        responsibility: >
+          Reviews auto-generated shadow deployment report: offline metrics vs
+          current Production baseline, latency distribution, prediction
+          distribution overlap. Must explicitly approve or reject in MLflow UI.
+      - role: ML Platform Lead
+        responsibility: >
+          Final production promotion approval. Reviews ML Reviewer notes.
+          Has authority to override ML Reviewer rejection with documented reason.
+    required_artifacts_before_approval:
+      shadow_deployment_report:
+        generated_by: shadow-report job (automatic after 24-hr shadow window)
+        location: "s3://prod-models/shadow-logs/{version}/report.json"
+        must_include: [latency_p50, latency_p95, auc_roc_vs_production,
+                       ndcg_vs_production, prediction_distribution_kl_divergence]
+      ab_experiment_plan:
+        required_when: traffic_percentage < 100
+        format: see ab_experiment_metadata section below
+        note: full-rollout promotions (100% traffic) do not require this artifact
+    review_sla_hours: 72
+    on_timeout:
+      action: auto-archive the Staging model
+      alert: "#ml-platform: Model {version} review timed out after 72 hr. Auto-archived."
+
+  production_to_archived:
+    automatic_triggers:
+      - condition: successor Production version stable for >= 48 hours
+        action: archive previous Production version
+      - condition: auto-rollback executed (alerts.yaml burn-rate or drift threshold)
+        action: archive the rolled-back version; restore previous
+    manual_trigger:
+      actor: ML Platform Lead
+      action: explicit archive via MLflow UI with documented reason
+
+# ── Required lineage fields ───────────────────────────────────────────────────
+
+lineage_fields:
+  # These tags must be set on the MLflow run before registration.
+  # The training pipeline sets all required fields automatically.
+
+  - name: training_data_uri
+    required: true
+    type: string
+    format: "s3://prod-data/events/snapshot/{ISO8601_datetime}/"
+    example: "s3://prod-data/events/snapshot/2026-06-01T00:00:00Z/"
+    description: S3 URI of the training dataset snapshot used for this run
+
+  - name: eval_data_uri
+    required: true
+    type: string
+    format: "s3://prod-data/eval/{YYYY-MM-DD}/"
+    example: "s3://prod-data/eval/2026-06-01/"
+    description: S3 URI of the held-out evaluation dataset
+
+  - name: feature_pipeline_git_sha
+    required: true
+    type: string
+    format: 7-character git SHA
+    example: "a3f1b9c"
+    description: Git SHA of the feature pipeline that produced training features
+
+  - name: training_code_git_sha
+    required: true
+    type: string
+    format: 7-character git SHA
+    example: "b4d2e1f"
+    description: Git SHA of the training pipeline code
+
+  - name: onnx_opset_version
+    required: true
+    type: integer
+    minimum: 17
+    example: 17
+    description: ONNX opset version used for export
+
+  - name: quantization
+    required: true
+    type: string
+    enum: [none, int8, fp16]
+    example: "int8"
+    description: Quantization applied to the exported ONNX artifact
+
+  - name: base_model_version
+    required: false
+    type: string
+    description: >
+      If this model was warm-started from an existing registry version,
+      its full version string. Omit for models trained from scratch.
+    example: "ranker/v1.2.0+def6789abc0"
+
+  - name: retrain_trigger
+    required: true
+    type: string
+    enum: [weekly_schedule, drift_signal, manual]
+    example: "drift_signal"
+    description: What initiated this training run
+
+# ── A/B experiment metadata ───────────────────────────────────────────────────
+
+ab_experiment_metadata:
+  description: >
+    When a model is promoted to Production as an A/B experiment variant
+    (traffic_percentage < 100), these fields must be set as MLflow tags
+    on the Production model version before the deploy job will proceed.
+  fields:
+    - name: experiment_variant_id
+      required: true
+      type: string
+      description: >
+        Variant identifier. Must match the value passed in the
+        X-Experiment-Variant request header for traffic to route correctly.
+      example: "ranker-v1.3-treatment"
+
+    - name: traffic_percentage
+      required: true
+      type: integer
+      range: 1-99
+      description: >
+        Percentage of eligible (warm) users routed to this variant.
+        100 is full rollout and does not require A/B metadata.
+      example: 10
+
+    - name: control_model_version
+      required: true
+      type: string
+      description: Full registry version string of the control model
+      example: "ranker/v1.2.1+ghi9012jkl3"
+
+    - name: success_metric
+      required: true
+      type: string
+      description: Primary business metric used to declare experiment winner
+      example: "7-day click-through rate on home-screen recommendations"
+
+    - name: minimum_sample_size
+      required: true
+      type: integer
+      description: >
+        Minimum number of unique users (per variant) required before
+        reading experiment results. Prevents early stopping on noise.
+      example: 50000
+
+    - name: experiment_end_date
+      required: true
+      type: string
+      format: ISO 8601 date
+      description: >
+        Date after which the experiment must be called (win/loss/inconclusive)
+        and the losing variant archived. Prevents zombie experiments.
+      example: "2026-07-06"
+
+# ── Retention policy ──────────────────────────────────────────────────────────
+
+retention:
+  production_artifacts:
+    rule: retained until successor Production version has been stable for 48 hours
+  staging_artifacts:
+    rule: retained for 14 days after Staging registration, then auto-archived
+  archived_artifacts:
+    rule: S3 artifact deleted after 180 days; MLflow metadata retained permanently
+  shadow_logs:
+    rule: retained in S3 for 30 days, then deleted
+  eval_reports:
+    rule: retained for 365 days for audit purposes
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+notifications:
+  channels:
+    ml_platform_slack: "#ml-platform"
+    oncall_pagerduty: "recommender-ml-oncall"
+  events:
+    - event: eval_gate_failed
+      channel: ml_platform_slack
+      template: >
+        "Eval gate FAIL | run: {run_id} | {metric}: {value} (need {threshold})"
+    - event: model_registered_to_staging
+      channel: ml_platform_slack
+      template: >
+        "New model ready for review | {version} | shadow deployment started.
+        Review SLA: 72 hours."
+    - event: model_promoted_to_production
+      channel: ml_platform_slack
+      template: >
+        "Model promoted | {version} | approver: {approver} | traffic: {traffic_pct}%"
+    - event: review_sla_timeout
+      channel: ml_platform_slack
+      template: >
+        "Review SLA breached | {version} | auto-archived. Retrain required."
+    - event: auto_rollback_executed
+      channel: oncall_pagerduty
+      template: >
+        "AUTO-ROLLBACK | {version} archived | previous Production restored.
+        Incident review required."
