@@ -1,0 +1,368 @@
+# cicd/.github/workflows/deploy-model.yml
+#
+# Recommender Service — CI/CD Deploy Pipeline
+#
+# Trigger:  push to main (full pipeline)
+#           workflow_dispatch (manual deploy with optional model version override)
+#
+# Job chain:
+#   lint → test → build → scan → push → validate-model → deploy-staging → deploy-production
+#
+# Image tag scheme: recommender:v{semver}-{7-char-sha}   (no 'latest' tag ever)
+# Model version:    read from MLflow Production stage, format ranker/v{semver}+{run-id}
+# Environment gates:
+#   staging:    automatic on push to main
+#   production: requires manual approval via GitHub Environments protection rule
+
+name: Deploy Recommender Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      model_version_override:
+        description: >
+          Override the MLflow Production model version
+          (format: ranker/v{semver}+{run-id}).
+          Leave empty to use the current Production stage version.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write        # OIDC authentication to AWS
+  security-events: write # Trivy SARIF upload to GitHub Security tab
+
+jobs:
+
+  # ── 1. lint ──────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint OpenAPI spec (Redocly)
+        run: |
+          npm install -g @redocly/cli@latest
+          npx @redocly/cli lint api/openapi.yaml --config api/.redocly.yaml
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Lint Python source (ruff)
+        run: |
+          pip install ruff==0.4.4
+          ruff check src/
+
+  # ── 2. test ──────────────────────────────────────────────────────────────────
+  test:
+    name: Test
+    needs: [lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest src/tests/ -v --tb=short --junitxml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 7
+
+  # ── 3. build ─────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    needs: [test]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.tag.outputs.image_tag }}
+      full_image: ${{ steps.tag.outputs.full_image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          SEMVER=$(cat VERSION)
+          SHA=$(git rev-parse --short=7 HEAD)
+          IMAGE_TAG="v${SEMVER}-${SHA}"
+          FULL_IMAGE="${{ vars.ECR_REGISTRY }}/recommender:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "full_image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Tag: recommender:${IMAGE_TAG}"
+          echo "No 'latest' tag is produced at any stage of this pipeline."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: container/Dockerfile
+          push: false
+          tags: ${{ steps.tag.outputs.full_image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Upload image tarball for downstream jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # ── 4. scan ──────────────────────────────────────────────────────────────────
+  scan:
+    name: Security Scan
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+
+      - name: Load image into Docker daemon
+        run: docker load --input /tmp/image.tar
+
+      - name: Trivy scan — CRITICAL (blocking)
+        # Pipeline fails here if any unfixed CRITICAL CVE is found.
+        uses: aquasecurity/trivy-action@0.20.0
+        with:
+          image-ref: ${{ needs.build.outputs.full_image }}
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Trivy scan — HIGH (non-blocking, report only)
+        uses: aquasecurity/trivy-action@0.20.0
+        if: always()
+        with:
+          image-ref: ${{ needs.build.outputs.full_image }}
+          format: sarif
+          output: trivy-high.sarif
+          severity: HIGH
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Upload HIGH findings to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-high.sarif
+
+  # ── 5. push ──────────────────────────────────────────────────────────────────
+  push:
+    name: Push to ECR
+    needs: [build, scan]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Download image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: /tmp
+
+      - name: Load and push image
+        run: |
+          docker load --input /tmp/image.tar
+          docker push ${{ needs.build.outputs.full_image }}
+          echo "Pushed: ${{ needs.build.outputs.full_image }}"
+
+  # ── 6. validate-model ────────────────────────────────────────────────────────
+  # Fetches the current Production model version from MLflow and validates
+  # it against the required format: ranker/v{semver}+{run-id}
+  # Outputs model_s3_uri and model_version for the deploy jobs.
+  # A manual override is accepted via workflow_dispatch input.
+  validate-model:
+    name: Validate Model Version
+    needs: [push]
+    runs-on: ubuntu-latest
+    outputs:
+      model_s3_uri: ${{ steps.validate.outputs.model_s3_uri }}
+      model_version: ${{ steps.validate.outputs.model_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install MLflow client
+        run: pip install mlflow==2.12.0
+
+      - name: Fetch and validate Production model version
+        # Script: scripts/fetch_model_version.py
+        # - Connects to MLflow using MLFLOW_TRACKING_URI + MLFLOW_TRACKING_TOKEN
+        # - If MODEL_VERSION_OVERRIDE is set, uses that value directly
+        # - Otherwise reads the Production-stage version of the 'ranker' model
+        #   and constructs: ranker/v{tags.semver}+{run_id[:12]}
+        # - Validates format with regex: ^ranker/v\d+\.\d+\.\d+\+[a-f0-9]+$
+        # - Writes model_s3_uri and model_version to GITHUB_OUTPUT
+        # - Exits 1 on any validation failure (missing semver tag, bad format)
+        id: validate
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+          MLFLOW_TRACKING_TOKEN: ${{ secrets.MLFLOW_TRACKING_TOKEN }}
+          MODEL_VERSION_OVERRIDE: ${{ inputs.model_version_override }}
+        run: python scripts/fetch_model_version.py
+
+  # ── 7. deploy-staging ────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build, validate-model]
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region "${{ vars.AWS_REGION }}"
+
+      - name: Set image and model env vars in staging
+        env:
+          IMAGE: ${{ needs.build.outputs.full_image }}
+          MODEL_S3_URI: ${{ needs.validate-model.outputs.model_s3_uri }}
+          MODEL_VERSION: ${{ needs.validate-model.outputs.model_version }}
+        run: |
+          kubectl set image deployment/recommender-service \
+            recommender="${IMAGE}" -n staging
+          kubectl set env deployment/recommender-service \
+            MODEL_S3_URI="${MODEL_S3_URI}" \
+            MODEL_VERSION="${MODEL_VERSION}" \
+            -n staging
+
+      - name: Wait for staging rollout
+        run: |
+          kubectl rollout status deployment/recommender-service \
+            -n staging --timeout=300s
+
+      - name: Staging smoke test
+        # /health does not require auth and confirms the process is alive.
+        # Pod startup (S3 model download + ONNX load) takes ~20 s; wait first.
+        run: |
+          sleep 20
+          curl --fail --silent \
+            "https://recommendations.internal.staging/health" \
+            | grep '"status":"ok"'
+          echo "Staging smoke test passed."
+
+  # ── 8. deploy-production ─────────────────────────────────────────────────────
+  # Requires manual approval via the 'production' GitHub Environment.
+  # Configure in: Settings → Environments → production → Required reviewers.
+  deploy-production:
+    name: Deploy to Production
+    needs: [build, validate-model, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name "${{ vars.EKS_CLUSTER_NAME }}" \
+            --region "${{ vars.AWS_REGION }}"
+
+      - name: Set image and model env vars in production
+        env:
+          IMAGE: ${{ needs.build.outputs.full_image }}
+          MODEL_S3_URI: ${{ needs.validate-model.outputs.model_s3_uri }}
+          MODEL_VERSION: ${{ needs.validate-model.outputs.model_version }}
+        run: |
+          kubectl set image deployment/recommender-service \
+            recommender="${IMAGE}" -n production
+          kubectl set env deployment/recommender-service \
+            MODEL_S3_URI="${MODEL_S3_URI}" \
+            MODEL_VERSION="${MODEL_VERSION}" \
+            -n production
+
+      - name: Wait for production rollout
+        run: |
+          kubectl rollout status deployment/recommender-service \
+            -n production --timeout=300s
+
+      - name: Verify X-Model-Version header post-deploy
+        # Hits the sync endpoint with a cold-start user (no feature store record).
+        # Cold-start users always return HTTP 200 with the X-Model-Version header set.
+        # This verifies the deployed pods are serving the expected model version.
+        env:
+          EXPECTED_VERSION: ${{ needs.validate-model.outputs.model_version }}
+        run: |
+          sleep 30
+          ACTUAL=$(curl --silent --head \
+            --header "X-Request-ID: deploy-verify-$$" \
+            "https://recommendations.internal.prod/v1/recommendations/deploy-smoke-user?limit=1" \
+            | grep -i "x-model-version:" \
+            | awk '{print $2}' \
+            | tr -d '\r')
+          if [ "${ACTUAL}" != "${EXPECTED_VERSION}" ]; then
+            echo "ERROR: X-Model-Version mismatch after production deploy."
+            echo "  Expected: ${EXPECTED_VERSION}"
+            echo "  Actual:   ${ACTUAL}"
+            echo "Run the rollback runbook: runbooks/rollback.md"
+            exit 1
+          fi
+          echo "X-Model-Version verified: ${ACTUAL}"
+
+      - name: Summarise deployment
+        env:
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          MODEL_VERSION: ${{ needs.validate-model.outputs.model_version }}
+        run: |
+          echo "Production deployment complete."
+          echo "  Image:         recommender:${IMAGE_TAG}"
+          echo "  Model version: ${MODEL_VERSION}"
+          echo "  Deployed by:   ${{ github.actor }}"
+          echo "  Commit:        ${{ github.sha }}"
