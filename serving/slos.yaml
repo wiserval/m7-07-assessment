@@ -1,0 +1,194 @@
+# SLO Specification — Recommender Service (Scenario X)
+#
+# This file defines the objectives and error budgets.
+# Prometheus alert rules implementing these SLOs are in monitoring/alerts.yaml.
+# The rollback runbook (runbooks/rollback.md) references alert names defined here.
+#
+# All RPS and latency values match the locked assumptions table and the
+# capacity plan in serving/capacity-plan.md.
+
+service: recommender-service
+scenario: Scenario X — Personalized in-app recommendations
+measurement_window: 30d
+
+# ── SLO 1: Availability ───────────────────────────────────────────────────────
+
+- name: Availability
+  description: >
+    Fraction of inference requests (sync and batch, excluding /health and /ready)
+    that return a non-5xx HTTP response. Cold-start fallback responses count as
+    successes. 5xx responses caused by upstream dependency failure (Redis, S3)
+    count as failures.
+
+  sli:
+    type: request_success_rate
+    good_requests: >
+      HTTP responses with status_code not in [500, 502, 503, 504]
+      on handlers matching /v1/recommendations.*
+    total_requests: >
+      All HTTP requests on handlers matching /v1/recommendations.*
+    prometheus_expr: >
+      sum(rate(http_requests_total{handler=~"/v1/recommendations.*",
+               status_code!~"5.."}[window]))
+      /
+      sum(rate(http_requests_total{handler=~"/v1/recommendations.*"}[window]))
+
+  target: 0.999
+  error_budget:
+    fraction: 0.001
+    monthly_minutes: 43.2
+    interpretation: >
+      At 350 RPS sustained, the monthly failure budget is approximately
+      350 × 86400 × 30 × 0.001 = 907,200 allowed failed requests per month.
+
+  burn_rate_alerts:
+    - alert_name: AvailabilityFastBurn
+      severity: page
+      on_call_channel: recommender-ml-oncall (PagerDuty)
+      burn_rate_threshold: 14.4
+      equivalent_error_rate: "1.44%"
+      windows:
+        long: 1h
+        short: 5m
+      condition: burn rate > 14.4 in BOTH windows simultaneously
+      meaning: >
+        At this rate, the entire monthly error budget is exhausted in ~2 days.
+        Immediate investigation required.
+
+    - alert_name: AvailabilitySlowBurn
+      severity: ticket
+      on_call_channel: "#ml-platform" (Slack)
+      burn_rate_threshold: 6
+      equivalent_error_rate: "0.6%"
+      windows:
+        long: 6h
+        short: 30m
+      condition: burn rate > 6 in BOTH windows simultaneously
+      meaning: >
+        At this rate, the monthly budget is exhausted in ~5 days.
+        Investigation required within 4 hours.
+
+# ── SLO 2: p95 Latency ────────────────────────────────────────────────────────
+
+- name: P95Latency
+  description: >
+    95th percentile end-to-end latency for sync GET /v1/recommendations/{user_id}
+    requests must be below 100 ms. This is the internal SLO target; the scenario
+    SLA is 120 ms, giving 20 ms of external margin.
+
+  sli:
+    type: latency_percentile
+    percentile: 95
+    threshold_ms: 100
+    scope: GET /v1/recommendations/{user_id} only (sync path; batch excluded)
+    prometheus_expr: >
+      histogram_quantile(0.95,
+        sum(rate(http_request_duration_seconds_bucket{
+          handler="/v1/recommendations/{user_id}",
+          method="GET"
+        }[window])) by (le)
+      ) * 1000  # convert to milliseconds
+
+  target: 0.95
+  error_budget:
+    fraction: 0.05
+    interpretation: >
+      5% of sync recommendation requests may exceed 100 ms per month.
+      At 800 RPS peak for 8 hours/day, that allows ~691,200 slow requests
+      per month before the SLO is breached.
+
+  burn_rate_alerts:
+    - alert_name: LatencySLABreach
+      severity: page
+      on_call_channel: recommender-ml-oncall (PagerDuty)
+      condition: p95 latency > 120 ms for >= 5 consecutive minutes
+      threshold_ms: 120
+      meaning: >
+        The scenario-defined SLA is being violated. User-facing impact is
+        confirmed. Immediate investigation and likely rollback.
+
+    - alert_name: LatencySLOBreach
+      severity: ticket
+      on_call_channel: "#ml-platform" (Slack)
+      condition: p95 latency > 100 ms for >= 15 consecutive minutes
+      threshold_ms: 100
+      meaning: >
+        Internal SLO is being violated but SLA is still intact.
+        Investigate within 2 hours; rollback may be required if trend continues.
+
+# ── SLO 3: p99 Latency ────────────────────────────────────────────────────────
+
+- name: P99Latency
+  description: >
+    99th percentile latency for sync requests must remain below 150 ms.
+    This bounds the long-tail experience for users on slower connections
+    or with larger feature vectors.
+
+  sli:
+    type: latency_percentile
+    percentile: 99
+    threshold_ms: 150
+    scope: GET /v1/recommendations/{user_id}
+    prometheus_expr: >
+      histogram_quantile(0.99,
+        sum(rate(http_request_duration_seconds_bucket{
+          handler="/v1/recommendations/{user_id}",
+          method="GET"
+        }[window])) by (le)
+      ) * 1000
+
+  target: 0.99
+
+  burn_rate_alerts:
+    - alert_name: P99LatencyBreach
+      severity: ticket
+      on_call_channel: "#ml-platform" (Slack)
+      condition: p99 latency > 150 ms for >= 10 consecutive minutes
+      threshold_ms: 150
+      meaning: >
+        Long-tail latency is degraded. Likely indicates resource pressure,
+        a slow Redis response, or an outlier inference path.
+
+# ── Observability-derived alerts ─────────────────────────────────────────────
+#
+# These are not classical SLOs but are graded in the rubric. Alert names are
+# defined here and implemented as PromQL rules in monitoring/alerts.yaml.
+# The rollback runbook references these names to trigger rollback conditions.
+
+auxiliary_alerts:
+  - alert_name: ModelVersionMismatch
+    severity: page
+    description: >
+      One or more pods are serving a model version that is not the current
+      MLflow Production version. Detected by reading the X-Model-Version
+      response header scraped per-pod by Prometheus. A mismatch indicates
+      a failed rollout, a stale pod, or an unauthorised model swap.
+    condition: >
+      Two or more distinct values of model_version label observed across
+      recommender pods for >= 10 consecutive minutes, AND the minority
+      version does not match the current Production tag in MLflow.
+    rollback_trigger: true
+
+  - alert_name: PredictionDistributionDrift
+    severity: ticket
+    description: >
+      The distribution of recommendation scores output by the ranker has
+      drifted significantly from the 7-day baseline, suggesting the model
+      is receiving inputs outside its training distribution or the model
+      artifact has changed unexpectedly.
+    condition: >
+      KL divergence between current 1-hour score distribution and
+      7-day baseline > 0.15, sustained for >= 30 consecutive minutes.
+    rollback_trigger: true
+
+# ── Reference ─────────────────────────────────────────────────────────────────
+
+reference:
+  capacity_plan: serving/capacity-plan.md
+  alert_rules: monitoring/alerts.yaml
+  rollback_runbook: runbooks/rollback.md
+  peak_rps: 800
+  sizing_target_rps: 1000
+  p95_slo_ms: 100
+  p95_sla_ms: 120
+  availability_target: "99.9%"
