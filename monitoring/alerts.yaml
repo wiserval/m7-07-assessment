@@ -1,0 +1,225 @@
+# Prometheus alerting rules — Recommender Service (Scenario X)
+#
+# Alert names in this file correspond exactly to those in serving/slos.yaml.
+# Rollback trigger thresholds are consumed by runbooks/rollback.md.
+#
+# Metrics expected from the service:
+#   http_requests_total{job,handler,status_code}    Counter
+#   http_request_duration_seconds_bucket{job,handler,le}  Histogram
+#   recommender_model_version_info{job,version}     Gauge — 1 per pod on startup
+#   recommender_prediction_kl_divergence{job}       Gauge — computed per inference window
+
+groups:
+
+  # ── Availability SLO burn-rate alerts ─────────────────────────────────────
+  - name: recommender.availability
+    interval: 30s
+    rules:
+
+      - alert: AvailabilityFastBurn
+        # Multi-window: fires only when BOTH the 1-hour AND 5-minute windows
+        # exceed burn rate 14.4× (error rate > 1.44%).
+        # At this rate the 30-day error budget (43.2 min) is exhausted in ~2 days.
+        # Matches: slos.yaml AvailabilityFastBurn — burn_rate_threshold: 14.4
+        expr: |
+          (
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*",status_code=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*"}[1h]))
+          ) > 0.0144
+          and
+          (
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*",status_code=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*"}[5m]))
+          ) > 0.0144
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          rollback_candidate: "true"
+        annotations:
+          summary: "Recommender: availability fast burn (burn rate > 14.4×)"
+          description: >
+            5xx error rate exceeds 1.44% in both the 1-hour and 5-minute windows.
+            Monthly error budget exhausts in ~2 days at this rate.
+            Check recent deploys and current model version. Rollback likely required.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          burn_rate: "14.4"
+          equivalent_error_rate: "1.44%"
+
+      - alert: AvailabilitySlowBurn
+        # Multi-window: fires only when BOTH the 6-hour AND 30-minute windows
+        # exceed burn rate 6× (error rate > 0.6%).
+        # At this rate the budget is exhausted in ~5 days.
+        # Matches: slos.yaml AvailabilitySlowBurn — burn_rate_threshold: 6
+        expr: |
+          (
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*",status_code=~"5.."}[6h]))
+            /
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*"}[6h]))
+          ) > 0.006
+          and
+          (
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*",status_code=~"5.."}[30m]))
+            /
+            sum(rate(http_requests_total{job="recommender",handler=~"/v1/recommendations.*"}[30m]))
+          ) > 0.006
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Recommender: availability slow burn (burn rate > 6×)"
+          description: >
+            5xx error rate exceeds 0.6% in both the 6-hour and 30-minute windows.
+            Monthly budget exhausts in ~5 days at this rate. Investigate within 4 hours.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          burn_rate: "6"
+          equivalent_error_rate: "0.6%"
+
+  # ── Latency SLO alerts ────────────────────────────────────────────────────
+  - name: recommender.latency
+    interval: 30s
+    rules:
+
+      - alert: LatencySLABreach
+        # p95 exceeds the scenario SLA of 120 ms for 5 consecutive minutes.
+        # User-facing impact confirmed. Page immediately.
+        # Matches: slos.yaml LatencySLABreach — threshold_ms: 120, for: 5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{
+                job="recommender",
+                handler="/v1/recommendations/{user_id}"
+              }[5m])
+            )
+          ) > 0.12
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+          rollback_candidate: "true"
+        annotations:
+          summary: "Recommender: p95 latency breaching 120 ms SLA"
+          description: >
+            p95 end-to-end latency for GET /v1/recommendations/{user_id} has exceeded
+            120 ms for 5 consecutive minutes. The scenario SLA is being violated.
+            Current value: {{ $value | humanizeDuration }}. Rollback likely required.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          threshold_ms: "120"
+          sla: "120ms end-to-end"
+
+      - alert: LatencySLOBreach
+        # p95 exceeds the internal SLO of 100 ms for 15 consecutive minutes.
+        # SLA (120 ms) not yet breached. Investigate before it escalates.
+        # Matches: slos.yaml LatencySLOBreach — threshold_ms: 100, for: 15m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{
+                job="recommender",
+                handler="/v1/recommendations/{user_id}"
+              }[5m])
+            )
+          ) > 0.10
+        for: 15m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Recommender: p95 latency breaching 100 ms internal SLO"
+          description: >
+            p95 latency exceeds 100 ms for 15 consecutive minutes. SLA intact but
+            trending toward breach. Check Redis latency, pod CPU, and recent deploys.
+            Investigate within 2 hours.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          threshold_ms: "100"
+          slo: "100ms p95 internal target"
+
+      - alert: P99LatencyBreach
+        # p99 exceeds 150 ms for 10 consecutive minutes.
+        # Matches: slos.yaml P99LatencyBreach — threshold_ms: 150, for: 10m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (
+              rate(http_request_duration_seconds_bucket{
+                job="recommender",
+                handler="/v1/recommendations/{user_id}"
+              }[5m])
+            )
+          ) > 0.15
+        for: 10m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Recommender: p99 latency exceeding 150 ms SLO"
+          description: >
+            p99 latency exceeds 150 ms for 10 consecutive minutes. Long-tail
+            degradation detected. Check Redis response times and ONNX inference
+            outliers. Current value: {{ $value | humanizeDuration }}.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          threshold_ms: "150"
+
+  # ── Model observability alerts ────────────────────────────────────────────
+  - name: recommender.model
+    interval: 60s
+    rules:
+
+      - alert: ModelVersionMismatch
+        # Fires when more than one distinct X-Model-Version value is observed
+        # across serving pods for 10 consecutive minutes.
+        #
+        # X-Model-Version is set from the MODEL_VERSION env var (container/README.md)
+        # and exposed as recommender_model_version_info{version="ranker/v1.3.0+abc123"}.
+        # This header is also documented in api/openapi.yaml components/headers/XModelVersion.
+        # All pods in a healthy deployment must serve the same version.
+        #
+        # Matches: slos.yaml ModelVersionMismatch — condition: > 1 distinct version for 10m
+        expr: |
+          count(
+            count by (version) (
+              recommender_model_version_info{job="recommender"}
+            )
+          ) > 1
+        for: 10m
+        labels:
+          severity: critical
+          team: ml-platform
+          rollback_candidate: "true"
+        annotations:
+          summary: "Recommender: multiple X-Model-Version values detected across pods"
+          description: >
+            More than one X-Model-Version has been observed across recommender pods
+            for 10 consecutive minutes. Expected: a single version matching the
+            MLflow Production stage. A mismatch indicates a stuck rollout, stale pod,
+            or unauthorised model swap. Verify with rollback runbook step 3.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          response_header: "X-Model-Version"
+          registry_stage: "MLflow Production"
+
+      - alert: PredictionDistributionDrift
+        # KL divergence between the current 1-hour prediction score distribution
+        # and the 7-day rolling baseline exceeds 0.15 for 30 consecutive minutes.
+        # Also triggers the retrain pipeline (see lifecycle/lifecycle.md).
+        # Matches: slos.yaml PredictionDistributionDrift — threshold: 0.15, for: 30m
+        expr: |
+          recommender_prediction_kl_divergence{job="recommender"} > 0.15
+        for: 30m
+        labels:
+          severity: warning
+          team: ml-platform
+          rollback_candidate: "true"
+        annotations:
+          summary: "Recommender: prediction score distribution drifting from 7-day baseline"
+          description: >
+            KL divergence between current prediction scores and 7-day baseline
+            exceeds 0.15 for 30 consecutive minutes
+            (current: {{ $value | printf "%.3f" }}). Likely causes: input feature
+            drift, data pipeline failure, or unexpected model artifact change.
+            Investigate before rollback; retrain trigger also fires.
+          runbook_url: "https://github.com/org/recommender/blob/main/runbooks/rollback.md"
+          threshold: "0.15"
+          retrain_trigger: "true"
