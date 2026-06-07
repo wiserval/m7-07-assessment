@@ -1,0 +1,10 @@
+# Redocly lint configuration for the Recommender Service API
+#
+# operation-4xx-response is disabled because /health and /ready are
+# Kubernetes liveness/readiness probes with no request body and no
+# client-controllable inputs that could produce a 4xx response.
+# Suppressing the rule here is preferable to adding a semantically
+# incorrect 4xx response to the spec.
+
+rules:
+  operation-4xx-response: off

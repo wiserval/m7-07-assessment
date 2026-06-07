@@ -1,0 +1,15 @@
+{
+  "user_id": "usr-8f2a1b",
+  "recommendations": [
+    { "item_id": "prod-7a3b1c", "score": 0.847, "rank": 1 },
+    { "item_id": "prod-2c9d4e", "score": 0.791, "rank": 2 },
+    { "item_id": "prod-5f8a2b", "score": 0.734, "rank": 3 }
+  ],
+  "model_version": "ranker/v1.3.0+abc1234def56",
+  "cold_start": false,
+  "_response_headers": {
+    "X-Model-Version": "ranker/v1.3.0+abc1234def56",
+    "X-Request-ID": "req-4a7b3c2d",
+    "X-Response-Time-Ms": 38
+  }
+}

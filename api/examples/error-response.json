@@ -1,0 +1,13 @@
+{
+  "error": {
+    "code": "FEATURE_STORE_UNAVAILABLE",
+    "message": "Redis feature store temporarily unreachable. Retry after 30 seconds.",
+    "request_id": "req-4a7b3c2d",
+    "timestamp": "2026-06-05T10:00:00Z",
+    "details": {
+      "dependency": "redis-feature-store",
+      "host": "recommender-redis.internal:6379",
+      "retry_after_seconds": 30
+    }
+  }
+}
